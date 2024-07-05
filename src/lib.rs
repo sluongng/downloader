@@ -711,21 +711,10 @@ mod tests {
                 let tar_gz = GzDecoder::new(cached_file);
                 let mut archive = Archive::new(tar_gz);
                 let expected_entry_count = count_entries(&expected_structure);
-                let mut actual_entry_count = 0;
-
-                for _entry in archive.entries()? {
-                    actual_entry_count += 1;
-                    // let entry = entry?;
-                    // let path = entry.path()?;
-                    // assert!(
-                    //     path.starts_with(&output_path),
-                    //     "Unexpected path in archive: {:?}",
-                    //     path
-                    // );
-                }
 
                 assert_eq!(
-                    actual_entry_count, expected_entry_count,
+                    archive.entries()?.count(),
+                    expected_entry_count,
                     "Cached tar.gz file should contain {} entries",
                     expected_entry_count
                 );
