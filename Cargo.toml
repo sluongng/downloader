@@ -7,6 +7,7 @@ edition = "2021"
 anyhow = "1.0.86"
 blake3 = "1.5.1"
 clap = { version = "4.5.8", features = ["derive"] }
+dirs = "5.0.1"
 flate2 = "1.0.30"
 reqwest = { version = "0.12.5", features = ["json"] }
 serde = { version = "1.0.203", features = ["derive"] }

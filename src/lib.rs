@@ -4,6 +4,7 @@ use flate2::read::GzDecoder;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use tar::Archive;
 use tokio::fs::{self, File};
 use tokio::io::AsyncWriteExt;
@@ -19,219 +20,268 @@ pub struct Args {
     /// Output file name or directory
     #[arg(short, long)]
     pub output: String,
+
+    /// Cache directory (optional)
+    #[arg(short, long)]
+    pub cache: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
 struct Config {
     urls: Vec<String>,
     digest: String,
-    cache_prefix: String,
-    file_type: Option<FileType>,
 }
 
-async fn load_config(config_path: &str) -> Result<Config> {
-    let config_data = fs::read_to_string(config_path)
-        .await
-        .context("Unable to read config file")?;
-    let config: Config =
-        serde_json::from_str(&config_data).context("Unable to parse config file")?;
-    Ok(config)
+struct Downloader {
+    cache: Cache,
+    verifier: Verifier,
 }
 
-pub async fn main_with_args(args: Args) -> Result<()> {
-    let config = load_config(&args.config).await?;
-    let file_type = config
-        .file_type
-        .unwrap_or(file_type_from_urls(config.urls.clone()));
+impl Downloader {
+    fn new(cache_base: Option<PathBuf>, verifier: Verifier) -> Self {
+        let cache_base_path =
+            cache_base.unwrap_or_else(|| dirs::cache_dir().expect("could not detect cache dir"));
 
-    download_from_urls(
-        config.urls,
-        &args.output,
-        &config.digest,
-        &config.cache_prefix,
-        file_type,
-    )
-    .await?;
-    println!("Download and validation successful!");
-
-    Ok(())
-}
-
-#[derive(Deserialize)]
-enum FileType {
-    File,
-    ArchiveZip,
-    ArchiveTarGz,
-}
-
-fn file_type_from_urls(urls: Vec<String>) -> FileType {
-    for url in urls {
-        if url.ends_with(".zip") {
-            return FileType::ArchiveZip;
-        }
-        if url.ends_with("tar.gz") {
-            return FileType::ArchiveTarGz;
+        Self {
+            cache: Cache::new(cache_base_path),
+            verifier,
         }
     }
-    FileType::File
-}
 
-async fn download_from_urls(
-    urls: Vec<String>,
-    output_path: &str,
-    expected_digest: &str,
-    cache_prefix: &str,
-    file_type: FileType,
-) -> Result<()> {
-    // Check if the file is already cached
-    let (hash_fn, hash, size) = digest_to_parts(expected_digest)?;
-    let cache_path = Path::new(cache_prefix).join("cas").join(hash_fn).join(hash);
-    if cache_path.exists() {
-        // Copy the cached file or directory to the output
-        copy_cache_to_output(&cache_path, output_path, file_type).await?;
-        return Ok(());
-    }
+    async fn download_from_urls(
+        &self,
+        urls: Vec<String>,
+        output_path: &str,
+        expected_digest: &str,
+    ) -> Result<()> {
+        let (hash_fn, hash, _) = digest_to_parts(expected_digest)?;
+        let file_type = FileType::from_urls(urls.clone());
+        let cache_path = self.cache.get_path(hash_fn, hash);
+        if cache_path.exists() {
+            self.cache
+                .copy_to_output(&cache_path, output_path, file_type)
+                .await?;
+            return Ok(());
+        }
 
-    for url in urls {
-        match reqwest::get(&url).await {
-            Ok(response) => {
-                if response.status().is_success() {
-                    let bytes = response.bytes().await?;
-
-                    // Validate the digest
-                    match validate_digest(&bytes, hash_fn, hash, size) {
-                        Ok(_) => {
-                            // Cache the file or directory
-                            cache_bytes(&bytes, &cache_path, output_path, file_type).await?;
-                            return Ok(());
-                        }
-                        Err(err) => {
-                            println!("Digest validation failed for URL: {}. {}", url, err);
+        for url in urls {
+            match reqwest::get(&url).await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        let bytes = response.bytes().await?;
+                        if self.verifier.validate_digest(&bytes).is_ok() {
+                            self.cache.write(&cache_path, &bytes).await?;
+                            return self
+                                .cache
+                                .copy_to_output(&cache_path, output_path, file_type)
+                                .await;
                         }
                     }
-                } else {
-                    println!(
-                        "Failed to download from URL: {}. Status: {}",
-                        url,
-                        response.status()
-                    );
                 }
-            }
-            Err(e) => {
-                println!("Error downloading from URL: {}. Error: {}", url, e);
+                Err(e) => println!("Error downloading from URL: {}. Error: {}", url, e),
             }
         }
+        Err(anyhow!("All URLs failed or digest validation failed"))
     }
-    Err(anyhow!("All URLs failed or digest validation failed"))
 }
 
-async fn copy_cache_to_output(
-    cache_path: &PathBuf,
-    output_path: &str,
-    file_type: FileType,
-) -> Result<()> {
-    match file_type {
-        FileType::ArchiveZip => {
-            fs::create_dir_all(output_path).await?;
-            let cache_file = File::open(&cache_path)
-                .await
-                .context("Failed to open cache file")?;
-            let mut archive = ZipArchive::new(cache_file.into_std().await)?;
+struct Cache {
+    base_path: PathBuf,
+}
 
-            tokio::fs::create_dir_all(output_path).await?;
-            for i in 0..archive.len() {
-                let mut file = archive.by_index(i)?;
-                let outpath = Path::new(output_path).join(file.mangled_name());
+impl Cache {
+    fn new(base_path: PathBuf) -> Self {
+        Self { base_path }
+    }
 
-                if file.name().ends_with('/') {
-                    tokio::fs::create_dir_all(&outpath).await?;
-                } else {
+    fn get_path(&self, hash_fn: &str, hash: &str) -> PathBuf {
+        self.base_path
+            .join("downloader")
+            .join("cas")
+            .join(hash_fn)
+            .join(hash)
+    }
+
+    async fn copy_to_output(
+        &self,
+        cache_path: &PathBuf,
+        output_path: &str,
+        file_type: FileType,
+    ) -> Result<()> {
+        match file_type {
+            FileType::ArchiveZip => {
+                fs::create_dir_all(output_path).await?;
+                let cache_file = File::open(&cache_path)
+                    .await
+                    .context("Failed to open cache file")?;
+                let mut archive = ZipArchive::new(cache_file.into_std().await)?;
+
+                tokio::fs::create_dir_all(output_path).await?;
+                for i in 0..archive.len() {
+                    let mut file = archive.by_index(i)?;
+                    let outpath = Path::new(output_path).join(file.mangled_name());
+
+                    if file.name().ends_with('/') {
+                        tokio::fs::create_dir_all(&outpath).await?;
+                    } else {
+                        if let Some(p) = outpath.parent() {
+                            if !p.exists() {
+                                tokio::fs::create_dir_all(p).await?;
+                            }
+                        }
+                        let outfile = File::create(&outpath).await?;
+                        std::io::copy(&mut file, &mut outfile.into_std().await)?;
+                    }
+
+                    // Get and Set permissions
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        if let Some(mode) = file.unix_mode() {
+                            tokio::fs::set_permissions(
+                                &outpath,
+                                std::fs::Permissions::from_mode(mode),
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+            FileType::ArchiveTarGz => {
+                let cache_file = File::open(&cache_path)
+                    .await
+                    .context("Failed to open cache file")?;
+                let cache_file_std = cache_file.into_std().await;
+                let tar = GzDecoder::new(cache_file_std);
+                let mut archive = Archive::new(tar);
+
+                for entry in archive.entries()? {
+                    let mut entry = entry?;
+                    let path = entry.path()?;
+                    let outpath = Path::new(output_path).join(path);
+
                     if let Some(p) = outpath.parent() {
                         if !p.exists() {
                             tokio::fs::create_dir_all(p).await?;
                         }
                     }
-                    let outfile = File::create(&outpath).await?;
-                    std::io::copy(&mut file, &mut outfile.into_std().await)?;
-                }
 
-                // Get and Set permissions
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Some(mode) = file.unix_mode() {
-                        tokio::fs::set_permissions(&outpath, std::fs::Permissions::from_mode(mode))
-                            .await?;
-                    }
+                    entry.unpack(&outpath)?;
                 }
             }
-        }
-        FileType::ArchiveTarGz => {
-            let cache_file = File::open(&cache_path)
-                .await
-                .context("Failed to open cache file")?;
-            let cache_file_std = cache_file.into_std().await;
-            let tar = GzDecoder::new(cache_file_std);
-            let mut archive = Archive::new(tar);
-
-            for entry in archive.entries()? {
-                let mut entry = entry?;
-                let path = entry.path()?;
-                let outpath = Path::new(output_path).join(path);
-
-                if let Some(p) = outpath.parent() {
-                    if !p.exists() {
-                        tokio::fs::create_dir_all(p).await?;
-                    }
-                }
-
-                entry.unpack(&outpath)?;
+            FileType::File => {
+                let mut cache_file = File::open(&cache_path)
+                    .await
+                    .context("Failed to open cache file")?;
+                let mut output_file = File::create(output_path)
+                    .await
+                    .context("Failed to create output file")?;
+                tokio::io::copy(&mut cache_file, &mut output_file)
+                    .await
+                    .context("Failed to copy from cache to output")?;
+                output_file
+                    .sync_all()
+                    .await
+                    .context("Failed to sync output file")?;
             }
         }
-        FileType::File => {
-            let mut cache_file = File::open(&cache_path)
-                .await
-                .context("Failed to open cache file")?;
-            let mut output_file = File::create(output_path)
-                .await
-                .context("Failed to create output file")?;
-            tokio::io::copy(&mut cache_file, &mut output_file)
-                .await
-                .context("Failed to copy from cache to output")?;
-            output_file
-                .sync_all()
-                .await
-                .context("Failed to sync output file")?;
+        Ok(())
+    }
+
+    async fn write(&self, cache_path: &PathBuf, bytes: &[u8]) -> Result<()> {
+        if let Some(parent) = cache_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        println!("writing cache file: {:?}", cache_path);
+        let mut cache_file = File::create(&cache_path)
+            .await
+            .context("Failed to create cache file")?;
+        cache_file
+            .write_all(bytes)
+            .await
+            .context("Failed to write to cache file")?;
+        cache_file
+            .flush()
+            .await
+            .context("Failed to sync cache file")
+    }
+}
+
+#[derive(PartialEq)]
+enum DigestFn {
+    SHA256,
+    BLAKE3,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParseDigestFnError;
+
+impl FromStr for DigestFn {
+    type Err = ParseDigestFnError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "sha256" => Ok(DigestFn::SHA256),
+            "blake3" => Ok(DigestFn::BLAKE3),
+            _ => Err(ParseDigestFnError),
         }
     }
-    Ok(())
 }
 
-async fn cache_bytes(
-    bytes: &[u8],
-    cache_path: &PathBuf,
-    output_path: &str,
-    file_type: FileType,
-) -> Result<()> {
-    if let Some(parent) = cache_path.parent() {
-        fs::create_dir_all(parent).await?;
+impl DigestFn {
+    fn compute_digest(&self, bytes: &[u8]) -> (String, usize) {
+        let size = bytes.len();
+        let hash = match self {
+            DigestFn::SHA256 => format!("{:x}", Sha256::digest(bytes)),
+            DigestFn::BLAKE3 => blake3::hash(bytes).to_hex().to_string(),
+        };
+        (hash, size)
     }
-    let mut cache_file = File::create(&cache_path)
-        .await
-        .context("Failed to create cache file")?;
-    cache_file
-        .write_all(bytes)
-        .await
-        .context("Failed to write to cache file")?;
-    cache_file
-        .sync_all()
-        .await
-        .context("Failed to sync cache file")?;
-
-    copy_cache_to_output(cache_path, output_path, file_type).await
 }
 
-fn digest_to_parts(digest: &str) -> Result<(&str, &str, usize)> {
+struct Verifier {
+    digest_fn: DigestFn,
+    hash: String,
+    size: usize,
+}
+
+impl Verifier {
+    pub fn new(digest: &str) -> Result<Self> {
+        let (hash_fn, hash_and_size) = digest
+            .split_once('-')
+            .ok_or_else(|| anyhow!("Invalid digest format"))?;
+        let digest_fn = DigestFn::from_str(hash_fn)
+            .expect(format!("Invalid digest function {}", hash_fn).as_str());
+        let (hash, size_str) = hash_and_size
+            .split_once('/')
+            .ok_or_else(|| anyhow!("Invalid digest format"))?;
+        let size: usize = size_str
+            .parse()
+            .map_err(|_| anyhow!("Invalid digest size"))?;
+        let hash = hash.to_string();
+
+        Ok(Self {
+            digest_fn,
+            hash,
+            size,
+        })
+    }
+
+    fn validate_digest(&self, bytes: &[u8]) -> Result<(), String> {
+        let (actual_hash, actual_size) = self.digest_fn.compute_digest(bytes);
+
+        if actual_hash == self.hash && actual_size == self.size {
+            Ok(())
+        } else {
+            Err(format!(
+                "Digest mismatch. Expected: {}/{}, Actual: {}/{}",
+                self.hash, self.size, actual_hash, actual_size
+            ))
+        }
+    }
+}
+
+pub fn digest_to_parts<'a>(digest: &'a str) -> Result<(&'a str, &'a str, usize)> {
     let (hash_fn, hash_and_size) = digest
         .split_once('-')
         .ok_or_else(|| anyhow!("Invalid digest format"))?;
@@ -245,26 +295,44 @@ fn digest_to_parts(digest: &str) -> Result<(&str, &str, usize)> {
     Ok((hash_fn, hash, size))
 }
 
-fn validate_digest(
-    bytes: &[u8],
-    hash_fn: &str,
-    expected_hash: &str,
-    expected_size: usize,
-) -> Result<(), String> {
-    let actual_size = bytes.len();
-    let actual_hash = match hash_fn {
-        "sha256" => format!("{:x}", Sha256::digest(bytes)),
-        "blake3" => blake3::hash(bytes).to_hex().to_string(),
-        _ => return Err(format!("Unsupported hash function: {}", hash_fn)),
-    };
+async fn load_config(config_path: &str) -> Result<Config> {
+    let config_data = fs::read_to_string(config_path)
+        .await
+        .context("Unable to read config file")?;
+    let config: Config =
+        serde_json::from_str(&config_data).context("Unable to parse config file")?;
+    Ok(config)
+}
 
-    if actual_hash == expected_hash && actual_size == expected_size {
-        Ok(())
-    } else {
-        Err(format!(
-            "Digest mismatch. Expected: {}/{}, Actual: {}/{}",
-            expected_hash, expected_size, actual_hash, actual_size
-        ))
+pub async fn main_with_args(args: Args) -> Result<()> {
+    let config = load_config(&args.config).await?;
+
+    let verifier = Verifier::new(&config.digest)?;
+    let downloader = Downloader::new(args.cache, verifier);
+
+    downloader
+        .download_from_urls(config.urls, &args.output, &config.digest)
+        .await
+}
+
+#[derive(Deserialize)]
+enum FileType {
+    File,
+    ArchiveZip,
+    ArchiveTarGz,
+}
+
+impl FileType {
+    fn from_urls(urls: Vec<String>) -> Self {
+        for url in urls {
+            if url.ends_with(".zip") {
+                return FileType::ArchiveZip;
+            }
+            if url.ends_with("tar.gz") {
+                return FileType::ArchiveTarGz;
+            }
+        }
+        FileType::File
     }
 }
 
@@ -326,20 +394,29 @@ mod tests {
                 // Extract the hash from the digest
                 let digest = config["digest"].as_str().unwrap();
                 let (hash_fn, hash, _) = digest_to_parts(digest)?;
-                let cached_file_path = cache_path.join("cas").join(hash_fn).join(hash);
+                let cached_file_path = cache_path
+                    .join("downloader")
+                    .join("cas")
+                    .join(hash_fn)
+                    .join(hash);
 
                 // Run the download
                 let args = Args {
                     config: config_path.to_str().unwrap().to_string(),
                     output: output_path.to_str().unwrap().to_string(),
+                    cache: Some(PathBuf::from(cache_path)),
                 };
-                main_with_args(args).await?;
+                main_with_args(args.clone()).await?;
 
                 assert!(fs::metadata(&output_path).is_ok());
                 let output_content = fs::read_to_string(&output_path)?;
                 assert_eq!(output_content, $expected_value);
 
-                assert!(fs::metadata(&cached_file_path).is_ok());
+                assert!(
+                    fs::metadata(&cached_file_path).is_ok(),
+                    "Cached file {:?} does not exist",
+                    cached_file_path
+                );
                 let cached_content = fs::read_to_string(&cached_file_path)?;
                 assert_eq!(cached_content, $expected_value);
 
@@ -348,10 +425,6 @@ mod tests {
                 fs::remove_file(&output_path)?;
 
                 // Run the download again to test for cache
-                let args = Args {
-                    config: config_path.to_str().unwrap().to_string(),
-                    output: output_path.to_str().unwrap().to_string(),
-                };
                 main_with_args(args).await?;
 
                 assert!(fs::metadata(&output_path).is_ok());
@@ -494,20 +567,29 @@ mod tests {
                 // Extract the hash from the digest
                 let digest = config["digest"].as_str().unwrap();
                 let (hash_fn, hash, _) = digest_to_parts(digest)?;
-                let cached_file_path = cache_path.join("cas").join(hash_fn).join(hash);
+                let cached_file_path = cache_path
+                    .join("downloader")
+                    .join("cas")
+                    .join(hash_fn)
+                    .join(hash);
 
                 // Run the download
                 let args = Args {
                     config: config_path.to_str().unwrap().to_string(),
                     output: output_path.to_str().unwrap().to_string(),
+                    cache: Some(PathBuf::from(cache_path)),
                 };
                 main_with_args(args).await?;
 
                 // Verify the extracted structure
                 verify_directory_structure(&output_path, &expected_structure)?;
 
-                // Check the cache directory contents
-                assert!(cached_file_path.is_file(), "Cached file does not exist");
+                // Check the cache archive file exist
+                assert!(
+                    cached_file_path.is_file(),
+                    "Cached file {:?} does not exist",
+                    cached_file_path
+                );
 
                 // Verify the cached file is a valid zip
                 let cached_file = File::open(&cached_file_path)?;
@@ -691,20 +773,29 @@ mod tests {
                 // Extract the hash from the digest
                 let digest = config["digest"].as_str().unwrap();
                 let (hash_fn, hash, _) = digest_to_parts(digest)?;
-                let cached_file_path = cache_path.join("cas").join(hash_fn).join(hash);
+                let cached_file_path = cache_path
+                    .join("downloader")
+                    .join("cas")
+                    .join(hash_fn)
+                    .join(hash);
 
                 // Run the download
                 let args = Args {
                     config: config_path.to_str().unwrap().to_string(),
                     output: output_path.to_str().unwrap().to_string(),
+                    cache: Some(PathBuf::from(cache_path)),
                 };
                 main_with_args(args).await?;
 
                 // Verify the extracted structure
                 verify_directory_structure(&output_path, &expected_structure)?;
 
-                // Check the cache directory contents
-                assert!(cached_file_path.is_file(), "Cached file does not exist");
+                // Check the cached archive file contents
+                assert!(
+                    cached_file_path.is_file(),
+                    "Cached file {:?} does not exist",
+                    cached_file_path
+                );
 
                 // Verify the cached file is a valid tar.gz
                 let cached_file = File::open(&cached_file_path)?;
