@@ -251,7 +251,7 @@ impl Verifier {
             .split_once('-')
             .ok_or_else(|| anyhow!("Invalid digest format"))?;
         let digest_fn = DigestFn::from_str(hash_fn)
-            .expect(format!("Invalid digest function {}", hash_fn).as_str());
+            .unwrap_or_else(|_| panic!("Invalid digest function {}", hash_fn));
         let (hash, size_str) = hash_and_size
             .split_once('/')
             .ok_or_else(|| anyhow!("Invalid digest format"))?;
@@ -281,7 +281,7 @@ impl Verifier {
     }
 }
 
-pub fn digest_to_parts<'a>(digest: &'a str) -> Result<(&'a str, &'a str, usize)> {
+pub fn digest_to_parts(digest: &str) -> Result<(&str, &str, usize)> {
     let (hash_fn, hash_and_size) = digest
         .split_once('-')
         .ok_or_else(|| anyhow!("Invalid digest format"))?;
