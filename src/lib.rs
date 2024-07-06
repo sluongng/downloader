@@ -65,7 +65,7 @@ impl Downloader {
         }
 
         for url in urls {
-            match reqwest::get(&url).await {
+            match reqwest::get(&url).await.context("Failed to get URL") {
                 Ok(response) => {
                     if response.status().is_success() {
                         let bytes = response.bytes().await?;
@@ -74,7 +74,8 @@ impl Downloader {
                             return self
                                 .cache
                                 .copy_to_output(&cache_path, output_path, file_type)
-                                .await;
+                                .await
+                                .context("Failed to copy to output after successful download");
                         }
                     }
                 }
@@ -142,7 +143,8 @@ impl Cache {
                                 &outpath,
                                 std::fs::Permissions::from_mode(mode),
                             )
-                            .await?;
+                            .await
+                            .context("failed to set file permission")?;
                         }
                     }
                 }
