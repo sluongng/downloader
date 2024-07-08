@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
+use core::fmt;
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -48,15 +49,16 @@ impl Downloader {
         }
     }
 
-    async fn download_from_urls(
-        &self,
-        urls: Vec<String>,
-        output_path: &str,
-        expected_digest: &str,
-    ) -> Result<()> {
-        let (hash_fn, hash, _) = digest_to_parts(expected_digest)?;
-        let file_type = FileType::from_urls(urls.clone());
-        let cache_path = self.cache.get_path(hash_fn, hash);
+    fn cache_path(&self) -> PathBuf {
+        self.cache.get_path(
+            self.verifier.digest_fn.to_string().as_str(),
+            &self.verifier.hash,
+        )
+    }
+
+    async fn download_from_urls(&self, urls: Vec<String>, output_path: &str) -> Result<()> {
+        let file_type = FileType::from(urls.clone());
+        let cache_path = self.cache_path();
         if cache_path.exists() {
             self.cache
                 .copy_to_output(&cache_path, output_path, file_type)
@@ -209,7 +211,7 @@ impl Cache {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum DigestFn {
     SHA256,
     BLAKE3,
@@ -230,6 +232,12 @@ impl FromStr for DigestFn {
     }
 }
 
+impl fmt::Display for DigestFn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", format!("{:?}", self).to_lowercase())
+    }
+}
+
 impl DigestFn {
     fn compute_digest(&self, bytes: &[u8]) -> (String, usize) {
         let size = bytes.len();
@@ -247,19 +255,24 @@ struct Verifier {
     size: usize,
 }
 
-impl Verifier {
-    pub fn new(digest: &str) -> Result<Self> {
+impl FromStr for Verifier {
+    type Err = ();
+
+    fn from_str(digest: &str) -> Result<Self, Self::Err> {
         let (hash_fn, hash_and_size) = digest
             .split_once('-')
-            .ok_or_else(|| anyhow!("Invalid digest format"))?;
+            .ok_or_else(|| anyhow!("Invalid digest format"))
+            .unwrap();
         let digest_fn = DigestFn::from_str(hash_fn)
             .unwrap_or_else(|_| panic!("Invalid digest function {}", hash_fn));
         let (hash, size_str) = hash_and_size
             .split_once('/')
-            .ok_or_else(|| anyhow!("Invalid digest format"))?;
+            .ok_or_else(|| anyhow!("Invalid digest format"))
+            .unwrap();
         let size: usize = size_str
             .parse()
-            .map_err(|_| anyhow!("Invalid digest size"))?;
+            .map_err(|_| anyhow!("Invalid digest size"))
+            .unwrap();
         let hash = hash.to_string();
 
         Ok(Self {
@@ -268,7 +281,9 @@ impl Verifier {
             size,
         })
     }
+}
 
+impl Verifier {
     fn validate_digest(&self, bytes: &[u8]) -> Result<(), String> {
         let (actual_hash, actual_size) = self.digest_fn.compute_digest(bytes);
 
@@ -283,37 +298,18 @@ impl Verifier {
     }
 }
 
-pub fn digest_to_parts(digest: &str) -> Result<(&str, &str, usize)> {
-    let (hash_fn, hash_and_size) = digest
-        .split_once('-')
-        .ok_or_else(|| anyhow!("Invalid digest format"))?;
-    let (hash, size_str) = hash_and_size
-        .split_once('/')
-        .ok_or_else(|| anyhow!("Invalid digest format"))?;
-    let size: usize = size_str
-        .parse()
-        .map_err(|_| anyhow!("Invalid digest size"))?;
-
-    Ok((hash_fn, hash, size))
-}
-
 async fn load_config(config_path: &str) -> Result<Config> {
     let config_data = fs::read_to_string(config_path)
         .await
         .context("Unable to read config file")?;
-    let config: Config =
-        serde_json::from_str(&config_data).context("Unable to parse config file")?;
-    Ok(config)
+    serde_json::from_str(&config_data).context("Unable to parse config file")
 }
 
 pub async fn main_with_args(args: Args) -> Result<()> {
     let config = load_config(&args.config).await?;
-
-    let verifier = Verifier::new(&config.digest)?;
-    let downloader = Downloader::new(args.cache, verifier);
-
-    downloader
-        .download_from_urls(config.urls, &args.output, &config.digest)
+    let verifier = Verifier::from_str(&config.digest).unwrap();
+    Downloader::new(args.cache, verifier)
+        .download_from_urls(config.urls, &args.output)
         .await
 }
 
@@ -324,8 +320,8 @@ enum FileType {
     ArchiveTarGz,
 }
 
-impl FileType {
-    fn from_urls(urls: Vec<String>) -> Self {
+impl From<Vec<String>> for FileType {
+    fn from(urls: Vec<String>) -> Self {
         for url in urls {
             if url.ends_with(".zip") {
                 return FileType::ArchiveZip;
@@ -371,7 +367,7 @@ mod tests {
     }
 
     macro_rules! test_download {
-        ($name:ident, $config:expr, $expected_value:expr) => {
+        ($name:ident, $config:expr, $expected_value:expr, $expected_cache_path:expr) => {
             #[tokio::test]
             async fn $name() -> Result<()> {
                 let config = $config;
@@ -394,13 +390,9 @@ mod tests {
                 write!(config_file, "{}", config_str)?;
 
                 // Extract the hash from the digest
-                let digest = config["digest"].as_str().unwrap();
-                let (hash_fn, hash, _) = digest_to_parts(digest)?;
-                let cached_file_path = cache_path
-                    .join("downloader")
-                    .join("cas")
-                    .join(hash_fn)
-                    .join(hash);
+                let cached_file_path = $expected_cache_path
+                    .to_string()
+                    .replace("{cache_prefix}", cache_path.to_str().unwrap());
 
                 // Run the download
                 let args = Args {
@@ -441,6 +433,49 @@ mod tests {
             }
         };
     }
+    test_download!(
+        base_case,
+        json!({
+            "urls": ["http://localhost:{port}/file_to_download.txt"],
+            "digest": "sha256-315f5bdb76d078c43b8ac0064e4a0164612b1fce77c869345bfc94c75894edd3/13",
+            "cache_prefix": "{cache_prefix}"
+        }),
+        "Hello, world!",
+        "{cache_prefix}/downloader/cas/sha256/315f5bdb76d078c43b8ac0064e4a0164612b1fce77c869345bfc94c75894edd3"
+    );
+    test_download!(
+        with_different_content,
+        json!({
+            "urls": ["http://localhost:{port}/file_to_download.txt"],
+            "digest": "sha256-9ca7a7d04afda0e4e47db2dbdd9878903674918451e7963fb42777a6a84bdd4a/18",
+            "cache_prefix": "{cache_prefix}"
+        }),
+        "Hello, downloader!",
+        "{cache_prefix}/downloader/cas/sha256/9ca7a7d04afda0e4e47db2dbdd9878903674918451e7963fb42777a6a84bdd4a"
+    );
+    test_download!(
+        with_invalid_url,
+        json!({
+            "urls": [
+                "http://invalid.url/somefile.txt",
+                "http://localhost:{port}/file_to_download.txt",
+            ],
+            "digest": "sha256-315f5bdb76d078c43b8ac0064e4a0164612b1fce77c869345bfc94c75894edd3/13",
+            "cache_prefix": "{cache_prefix}"
+        }),
+        "Hello, world!",
+        "{cache_prefix}/downloader/cas/sha256/315f5bdb76d078c43b8ac0064e4a0164612b1fce77c869345bfc94c75894edd3"
+    );
+    test_download!(
+        with_blake3,
+        json!({
+            "urls": ["http://localhost:{port}/file_to_download.txt"],
+            "digest": "blake3-ede5c0b10f2ec4979c69b52f61e42ff5b413519ce09be0f14d098dcfe5f6f98d/13",
+            "cache_prefix": "{cache_prefix}"
+        }),
+        "Hello, world!",
+        "{cache_prefix}/downloader/cas/blake3/ede5c0b10f2ec4979c69b52f61e42ff5b413519ce09be0f14d098dcfe5f6f98d"
+    );
 
     // Helper function to start a server with custom zip content
     async fn start_custom_zip_server(
@@ -543,11 +578,11 @@ mod tests {
     }
 
     macro_rules! test_download_archive {
-        ($name:ident, $config:expr, $expected_structure:expr) => {
+        ($name:ident, $config:expr, $expected_content:expr, $expected_cache_path:expr) => {
             #[tokio::test]
             async fn $name() -> Result<()> {
                 let config = $config;
-                let expected_structure = $expected_structure;
+                let expected_structure = $expected_content;
 
                 // Start the local server with custom zip content
                 let (port, shutdown_tx) = start_custom_zip_server(&expected_structure).await?;
@@ -567,13 +602,9 @@ mod tests {
                 write!(config_file, "{}", config_str)?;
 
                 // Extract the hash from the digest
-                let digest = config["digest"].as_str().unwrap();
-                let (hash_fn, hash, _) = digest_to_parts(digest)?;
-                let cached_file_path = cache_path
-                    .join("downloader")
-                    .join("cas")
-                    .join(hash_fn)
-                    .join(hash);
+                let cached_file_path = $expected_cache_path
+                    .to_string()
+                    .replace("{cache_prefix}", cache_path.to_str().unwrap());
 
                 // Run the download
                 let args = Args {
@@ -588,7 +619,7 @@ mod tests {
 
                 // Check the cache archive file exist
                 assert!(
-                    cached_file_path.is_file(),
+                    fs::metadata(&cached_file_path).is_ok(),
                     "Cached file {:?} does not exist",
                     cached_file_path
                 );
@@ -612,46 +643,6 @@ mod tests {
         };
     }
 
-    test_download!(
-        base_case,
-        json!({
-            "urls": ["http://localhost:{port}/file_to_download.txt"],
-            "digest": "sha256-315f5bdb76d078c43b8ac0064e4a0164612b1fce77c869345bfc94c75894edd3/13",
-            "cache_prefix": "{cache_prefix}"
-        }),
-        "Hello, world!"
-    );
-    test_download!(
-        with_different_content,
-        json!({
-            "urls": ["http://localhost:{port}/file_to_download.txt"],
-            "digest": "sha256-9ca7a7d04afda0e4e47db2dbdd9878903674918451e7963fb42777a6a84bdd4a/18",
-            "cache_prefix": "{cache_prefix}"
-        }),
-        "Hello, downloader!"
-    );
-    test_download!(
-        with_invalid_url,
-        json!({
-            "urls": [
-                "http://invalid.url/somefile.txt",
-                "http://localhost:{port}/file_to_download.txt",
-            ],
-            "digest": "sha256-315f5bdb76d078c43b8ac0064e4a0164612b1fce77c869345bfc94c75894edd3/13",
-            "cache_prefix": "{cache_prefix}"
-        }),
-        "Hello, world!"
-    );
-    test_download!(
-        with_blake3,
-        json!({
-            "urls": ["http://localhost:{port}/file_to_download.txt"],
-            "digest": "blake3-ede5c0b10f2ec4979c69b52f61e42ff5b413519ce09be0f14d098dcfe5f6f98d/13",
-            "cache_prefix": "{cache_prefix}"
-        }),
-        "Hello, world!"
-    );
-
     test_download_archive!(
         zip_with_files,
         json!({
@@ -662,7 +653,8 @@ mod tests {
         vec![
             ArchiveEntry::File("file1.txt".to_string()),
             ArchiveEntry::File("file2.txt".to_string())
-        ]
+        ],
+        "{cache_prefix}/downloader/cas/sha256/f3d4199459e64d5b8c2e5ebc426970a1c1cc4b3b0d704789fb0975f4cc180644"
     );
     test_download_archive!(
         zip_with_dir,
@@ -677,7 +669,8 @@ mod tests {
                 "foo".to_string(),
                 vec![ArchiveEntry::File("file2.txt".to_string())]
             ),
-        ]
+        ],
+        "{cache_prefix}/downloader/cas/sha256/dedd5459a6b30a8f74836d562a13398a96d4d1e56443aa8de74069c6b2ec5ac1"
     );
     test_download_archive!(
         zip_with_blake3,
@@ -692,7 +685,8 @@ mod tests {
                 "foo".to_string(),
                 vec![ArchiveEntry::File("file2.txt".to_string())]
             ),
-        ]
+        ],
+        "{cache_prefix}/downloader/cas/blake3/c03560f38064a39ae621b84e898b689f9d41bbf6cf0af49895ff2bf5f626d3e9"
     );
 
     // Helper function to start a server with custom tar.gz content
@@ -749,11 +743,11 @@ mod tests {
     }
 
     macro_rules! test_download_targz {
-        ($name:ident, $config:expr, $expected_structure:expr) => {
+        ($name:ident, $config:expr, $expected_content:expr, $expected_cache_path:expr) => {
             #[tokio::test]
             async fn $name() -> Result<()> {
                 let config = $config;
-                let expected_structure = $expected_structure;
+                let expected_structure = $expected_content;
 
                 // Start the local server with custom tar.gz content
                 let (port, shutdown_tx) = start_custom_targz_server(&expected_structure).await?;
@@ -773,13 +767,9 @@ mod tests {
                 write!(config_file, "{}", config_str)?;
 
                 // Extract the hash from the digest
-                let digest = config["digest"].as_str().unwrap();
-                let (hash_fn, hash, _) = digest_to_parts(digest)?;
-                let cached_file_path = cache_path
-                    .join("downloader")
-                    .join("cas")
-                    .join(hash_fn)
-                    .join(hash);
+                let cached_file_path = $expected_cache_path
+                    .to_string()
+                    .replace("{cache_prefix}", cache_path.to_str().unwrap());
 
                 // Run the download
                 let args = Args {
@@ -794,7 +784,7 @@ mod tests {
 
                 // Check the cached archive file contents
                 assert!(
-                    cached_file_path.is_file(),
+                    fs::metadata(&cached_file_path).is_ok(),
                     "Cached file {:?} does not exist",
                     cached_file_path
                 );
@@ -829,6 +819,7 @@ mod tests {
         vec![
             ArchiveEntry::File("file1.txt".to_string()),
             ArchiveEntry::File("file2.txt".to_string())
-        ]
+        ],
+        "{cache_prefix}/downloader/cas/sha256/51d2ee272e361eecafef092b4330df7c40ebac3375212a1b5d663217d9f3d4a4"
     );
 }
